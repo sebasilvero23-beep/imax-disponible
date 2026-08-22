@@ -1,25 +1,11 @@
 """
-Bot de aviso: nuevas funciones de "La Odisea" (IMAX Norcenter)
-------------------------------------------------------------------
-Objetivo: avisarte apenas el cine publique funciones para el 6 de
-agosto de 2026 en adelante (hoy sólo hay cargado hasta el 5/8).
+Monitor de nuevas fechas de "La Odisea" en IMAX Norcenter.
 
-IMPORTANTE - esta versión es mucho más liviana que la anterior:
-  - NO hace falta login (el dropdown de días es público).
-  - NO reserva ninguna entrada ni toca el mapa de asientos.
-  - Sólo lee las opciones del selector de "Día" para Cine=IMAX Norcenter
-    y Película=La Odisea, y compara contra la fecha de corte.
-
-Por ser una consulta liviana (nada de reservas ni login), se puede
-correr con un intervalo corto sin preocuparse por el riesgo de la
-cuenta.
-
-Una vez que aparezcan fechas nuevas, el mail avisa para que entres vos
-a elegir horario (19:00 o 22:35) y completar la compra. Si más adelante
-querés que el bot también chequee la disponibilidad de asientos
-preferidos (filas H/I/J, 17-20) para esas nuevas funciones, se puede
-retomar el bot anterior (el que sí requiere login) una vez que existan
-funciones reales para reservar.
+- Lee el selector público de días de Showcase/Voy al Cine.
+- Primera ejecución: guarda todas las fechas actuales como línea base y NO alerta.
+- Siguientes ejecuciones: avisa sólo si aparece una fecha que nunca había visto.
+- Compatible con el workflow original del repo: usa notified_state.json.
+- No hace login, no reserva entradas y no toca el mapa de asientos.
 """
 
 import json
@@ -34,171 +20,253 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
-
 URL_BOLETERIA = "https://www.voyalcine.net/showcase/boleteria.aspx"
-
 CINE_TEXTO = "IMAX Theatre (Norcenter)"
 PELICULA_TEXTO = "La Odisea"
 
-# Fecha de corte: avisar apenas aparezca un día >= a esta fecha.
-FECHA_CORTE = date(2026, 8, 6)
-
-# --- Selectores reales del sitio (verificados) ---
 SEL_CINE = "select#ctl00_Contenido_lstCinemaFull"
 SEL_PELICULA = "select#ctl00_Contenido_lstMovies"
 SEL_FORMATO = "select#ctl00_Contenido_lstFormat"
 SEL_DIA = "select#ctl00_Contenido_lstDays"
 
-# --- Email (variables de entorno / GitHub Secrets) ---
 EMAIL_FROM = os.environ.get("EMAIL_FROM")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_FROM)
+
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 
+# Mantiene el mismo nombre que ya guarda el workflow original.
 STATE_FILE = Path(__file__).parent / "notified_state.json"
 
 MESES = {
-    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
-    "julio": 7, "agosto": 8, "septiembre": 9, "octubre": 10,
-    "noviembre": 11, "diciembre": 12,
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
 }
-
-# ============================================================
-# LÓGICA
-# ============================================================
 
 
 def parsear_fecha(texto: str) -> date | None:
-    """Convierte 'miércoles, 6 de agosto de 2026' en date(2026, 8, 6)."""
-    m = re.search(r"(\d{1,2})\s+de\s+([a-zA-Zá-ú]+)\s+de\s+(\d{4})", texto, re.I)
+    m = re.search(
+        r"(\d{1,2})\s+de\s+([a-zA-ZáéíóúÁÉÍÓÚñÑ]+)\s+de\s+(\d{4})",
+        texto,
+        re.I,
+    )
     if not m:
         return None
-    dia, mes_nombre, anio = m.group(1), m.group(2).lower(), m.group(3)
-    mes = MESES.get(mes_nombre)
+
+    dia = int(m.group(1))
+    mes = MESES.get(m.group(2).lower())
+    anio = int(m.group(3))
+
     if not mes:
         return None
-    return date(int(anio), mes, int(dia))
+
+    return date(anio, mes, dia)
 
 
-def cargar_estado() -> set:
-    if STATE_FILE.exists():
-        return set(json.loads(STATE_FILE.read_text()))
-    return set()
+def cargar_estado():
+    if not STATE_FILE.exists():
+        return None
+
+    data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+
+    # Compatibilidad por si el archivo viejo era una lista.
+    if isinstance(data, list):
+        return {"seen_dates": data}
+
+    return data
 
 
-def guardar_estado(estado: set):
-    STATE_FILE.write_text(json.dumps(sorted(estado)))
+def guardar_estado(estado: dict):
+    STATE_FILE.write_text(
+        json.dumps(estado, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
-def _enviar_mail(asunto: str, cuerpo: str):
-    if not EMAIL_FROM or not EMAIL_APP_PASSWORD:
-        print("Faltan EMAIL_FROM / EMAIL_APP_PASSWORD en variables de entorno.")
-        return
-    msg = MIMEText(cuerpo, "plain", "utf-8")
-    msg["Subject"] = asunto
-    msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-    ctx = ssl.create_default_context()
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as server:
-        server.login(EMAIL_FROM, EMAIL_APP_PASSWORD)
-        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+def enviar_mail(asunto: str, cuerpo: str) -> bool:
+    if not EMAIL_FROM or not EMAIL_APP_PASSWORD or not EMAIL_TO:
+        print("Faltan EMAIL_FROM, EMAIL_APP_PASSWORD o EMAIL_TO.")
+        return False
+
+    try:
+        msg = MIMEText(cuerpo, "plain", "utf-8")
+        msg["Subject"] = asunto
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+
+        ctx = ssl.create_default_context()
+
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as server:
+            server.login(EMAIL_FROM, EMAIL_APP_PASSWORD)
+            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+
+        print("Mail enviado OK.")
+        return True
+
+    except Exception as exc:
+        print(f"ERROR enviando mail: {exc}")
+        return False
 
 
-def enviar_mail_nuevas_fechas(fechas_nuevas: list):
-    fechas_str = "\n".join(f"  - {f}" for f in fechas_nuevas)
-    cuerpo = f"""¡Salieron funciones nuevas de {PELICULA_TEXTO}!
-
-Cine: {CINE_TEXTO}
-Nuevas fechas publicadas:
-{fechas_str}
-
-Entrá ya a elegir horario (19:00 o 22:35) y asiento antes de que se agote:
-{URL_BOLETERIA}
-"""
-    _enviar_mail(f"🎬 Nuevas funciones de {PELICULA_TEXTO} disponibles", cuerpo)
-    print(f"Mail enviado. Fechas nuevas: {fechas_nuevas}")
-
-
-def enviar_mail_alerta_fallo(error: Exception):
-    cuerpo = f"""El bot de aviso de nuevas funciones encontró un error.
-
-Error:
-{repr(error)}
-
-Puede ser que cambió el HTML del sitio, o que la película salió de
-cartelera. Revisá el workflow en GitHub Actions para más detalle.
-"""
-    _enviar_mail("⚠️ El bot de nuevas funciones se rompió - revisar", cuerpo)
-
-
-def buscar_fechas_disponibles(page) -> list:
-    page.goto(URL_BOLETERIA, wait_until="networkidle")
+def buscar_fechas_disponibles(page) -> dict[str, str]:
+    page.goto(URL_BOLETERIA, wait_until="networkidle", timeout=60000)
 
     page.select_option(SEL_CINE, label=CINE_TEXTO)
     page.wait_for_timeout(1500)
 
     opciones_pelicula = page.query_selector_all(f"{SEL_PELICULA} option")
-    textos_pelicula = [o.inner_text() for o in opciones_pelicula]
+    textos_pelicula = [o.inner_text().strip() for o in opciones_pelicula]
+
     patron = re.compile(re.escape(PELICULA_TEXTO), re.I)
     coincidencia = next((t for t in textos_pelicula if patron.search(t)), None)
 
     if coincidencia is None:
         raise RuntimeError(
-            f"No se encontró la película '{PELICULA_TEXTO}' en la lista. "
-            f"Opciones disponibles: {textos_pelicula}"
+            f"No se encontró '{PELICULA_TEXTO}'. Opciones: {textos_pelicula}"
         )
 
     page.select_option(SEL_PELICULA, label=coincidencia)
     page.wait_for_timeout(1500)
 
-    page.select_option(SEL_FORMATO, index=1)
+    opciones_formato = page.query_selector_all(f"{SEL_FORMATO} option")
+    formatos = []
+
+    for opcion in opciones_formato:
+        texto = opcion.inner_text().strip()
+        valor = opcion.get_attribute("value")
+
+        if texto and valor:
+            formatos.append((texto, valor))
+
+    if not formatos:
+        raise RuntimeError("No se encontraron formatos disponibles.")
+
+    formato_imax = next(
+        (item for item in formatos if "IMAX" in item[0].upper()),
+        formatos[0],
+    )
+
+    page.select_option(SEL_FORMATO, value=formato_imax[1])
     page.wait_for_timeout(1500)
 
-    opciones = page.query_selector_all(f"{SEL_DIA} option")
-    textos = [o.inner_text() for o in opciones if o.inner_text().strip()]
+    opciones_dia = page.query_selector_all(f"{SEL_DIA} option")
+    fechas = {}
 
-    if not textos:
+    for opcion in opciones_dia:
+        texto = opcion.inner_text().strip()
+
+        if not texto:
+            continue
+
+        fecha = parsear_fecha(texto)
+
+        if fecha:
+            fechas[fecha.isoformat()] = texto
+
+    if not fechas:
+        textos = [o.inner_text().strip() for o in opciones_dia]
         raise RuntimeError(
-            "No se encontró ninguna fecha en el selector de día. Es "
-            "posible que 'La Odisea' haya salido de cartelera en este "
-            "cine, o que cambiaron los selectores del sitio."
+            f"No se pudieron leer fechas válidas. Opciones visibles: {textos}"
         )
 
-    return textos
+    return dict(sorted(fechas.items()))
 
 
 def main():
-    estado_notificado = cargar_estado()
-
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            textos_fecha = buscar_fechas_disponibles(page)
+            page = browser.new_page(locale="es-AR")
+
+            fechas_actuales = buscar_fechas_disponibles(page)
+
             browser.close()
 
-        fechas_nuevas = []
-        for texto in textos_fecha:
-            fecha = parsear_fecha(texto)
-            if fecha and fecha >= FECHA_CORTE and texto not in estado_notificado:
-                fechas_nuevas.append(texto)
+        print("Fechas actualmente publicadas:")
 
-        if fechas_nuevas:
-            enviar_mail_nuevas_fechas(fechas_nuevas)
-            estado_notificado.update(fechas_nuevas)
+        for iso, etiqueta in fechas_actuales.items():
+            print(f"  {iso} | {etiqueta}")
+
+        estado = cargar_estado()
+        actuales = set(fechas_actuales.keys())
+
+        # Primera ejecución: crear línea base sin alertar.
+        if estado is None:
+            guardar_estado(
+                {
+                    "seen_dates": sorted(actuales),
+                    "current_dates": sorted(actuales),
+                    "labels": fechas_actuales,
+                }
+            )
+
+            print("Primera ejecución: línea base creada. No se envía alerta.")
+            return
+
+        vistas = set(estado.get("seen_dates", []))
+        nuevas = sorted(actuales - vistas)
+
+        if nuevas:
+            lineas = "\n".join(
+                f"• {fechas_actuales[fecha]}" for fecha in nuevas
+            )
+
+            cuerpo = (
+                "🚨 LA ODISEA — NUEVAS FECHAS IMAX NORCENTER\n\n"
+                f"{lineas}\n\n"
+                "Entrá ahora a comprar:\n"
+                f"{URL_BOLETERIA}"
+            )
+
+            print(f"Nuevas fechas detectadas: {nuevas}")
+
+            if not enviar_mail(
+                "🚨 Nuevas fechas de La Odisea en IMAX Norcenter",
+                cuerpo,
+            ):
+                # No marcar como vistas si el mail falló.
+                estado["current_dates"] = sorted(actuales)
+                estado["labels"] = fechas_actuales
+                guardar_estado(estado)
+                sys.exit(2)
+
+            vistas.update(nuevas)
+
         else:
-            print("Todavía no hay fechas nuevas (>= 6 de agosto).")
+            print("Sin fechas nuevas.")
 
-        guardar_estado(estado_notificado)
+        estado["seen_dates"] = sorted(vistas)
+        estado["current_dates"] = sorted(actuales)
+        estado["labels"] = fechas_actuales
+
+        guardar_estado(estado)
+
         print("Revisión completada OK.")
 
-    except Exception as e:
-        print(f"ERROR: {e}")
-        enviar_mail_alerta_fallo(e)
+    except Exception as exc:
+        print(f"ERROR: {exc}")
+
+        if EMAIL_FROM and EMAIL_APP_PASSWORD and EMAIL_TO:
+            enviar_mail(
+                "⚠️ Falló el monitor de La Odisea",
+                (
+                    "El monitor de La Odisea en IMAX Norcenter falló.\n\n"
+                    f"Error: {repr(exc)}\n\n"
+                    "Revisá GitHub Actions."
+                ),
+            )
+
         sys.exit(1)
 
 
