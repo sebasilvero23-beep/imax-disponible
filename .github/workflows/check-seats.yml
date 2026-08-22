@@ -3,7 +3,7 @@ name: Chequear nuevas funciones de La Odisea
 on:
   schedule:
     # Cada 10 minutos. No requiere login ni reservas, es liviano.
-    - cron: "*/10 * * * *"
+    - cron: "7,17,27,37,47,57 * * * *"
   workflow_dispatch: {}   # permite tirarlo a mano desde la pestaña Actions
 
 jobs:
