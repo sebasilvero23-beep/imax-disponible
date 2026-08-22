@@ -1,11 +1,9 @@
 """
-Monitor de nuevas fechas de "La Odisea" en IMAX Norcenter.
+Monitor robusto de nuevas fechas de "La Odisea" en IMAX Norcenter.
 
-- Lee el selector público de días de Showcase/Voy al Cine.
-- Primera ejecución: guarda todas las fechas actuales como línea base y NO alerta.
-- Siguientes ejecuciones: avisa sólo si aparece una fecha que nunca había visto.
-- Compatible con el workflow original del repo: usa notified_state.json.
-- No hace login, no reserva entradas y no toca el mapa de asientos.
+- Reintenta si Showcase carga incompleto.
+- No manda mail por errores transitorios.
+- Mantiene notified_state.json.
 """
 
 import json
@@ -14,10 +12,10 @@ import re
 import smtplib
 import ssl
 import sys
+import time
 from datetime import date
 from email.mime.text import MIMEText
 from pathlib import Path
-
 from playwright.sync_api import sync_playwright
 
 URL_BOLETERIA = "https://www.voyalcine.net/showcase/boleteria.aspx"
@@ -33,242 +31,232 @@ EMAIL_FROM = os.environ.get("EMAIL_FROM")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD")
 EMAIL_TO = os.environ.get("EMAIL_TO", EMAIL_FROM)
 
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 465
-
-# Mantiene el mismo nombre que ya guarda el workflow original.
 STATE_FILE = Path(__file__).parent / "notified_state.json"
+MAX_INTENTOS = 4
+ESPERA_ENTRE_INTENTOS = 8
 
 MESES = {
-    "enero": 1,
-    "febrero": 2,
-    "marzo": 3,
-    "abril": 4,
-    "mayo": 5,
-    "junio": 6,
-    "julio": 7,
-    "agosto": 8,
-    "septiembre": 9,
-    "octubre": 10,
-    "noviembre": 11,
-    "diciembre": 12,
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5,
+    "junio": 6, "julio": 7, "agosto": 8, "septiembre": 9,
+    "octubre": 10, "noviembre": 11, "diciembre": 12,
 }
 
+class ErrorTransitorioShowcase(RuntimeError):
+    pass
 
-def parsear_fecha(texto: str) -> date | None:
+def parsear_fecha(texto):
     m = re.search(
         r"(\d{1,2})\s+de\s+([a-zA-ZáéíóúÁÉÍÓÚñÑ]+)\s+de\s+(\d{4})",
-        texto,
-        re.I,
+        texto, re.I
     )
     if not m:
         return None
-
-    dia = int(m.group(1))
     mes = MESES.get(m.group(2).lower())
-    anio = int(m.group(3))
-
     if not mes:
         return None
-
-    return date(anio, mes, dia)
-
+    return date(int(m.group(3)), mes, int(m.group(1)))
 
 def cargar_estado():
     if not STATE_FILE.exists():
         return None
-
     data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-
-    # Compatibilidad por si el archivo viejo era una lista.
     if isinstance(data, list):
         return {"seen_dates": data}
-
     return data
 
-
-def guardar_estado(estado: dict):
+def guardar_estado(estado):
     STATE_FILE.write_text(
         json.dumps(estado, ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
 
-
-def enviar_mail(asunto: str, cuerpo: str) -> bool:
+def enviar_mail(asunto, cuerpo):
     if not EMAIL_FROM or not EMAIL_APP_PASSWORD or not EMAIL_TO:
-        print("Faltan EMAIL_FROM, EMAIL_APP_PASSWORD o EMAIL_TO.")
+        print("Faltan secrets de email.")
         return False
-
     try:
         msg = MIMEText(cuerpo, "plain", "utf-8")
         msg["Subject"] = asunto
         msg["From"] = EMAIL_FROM
         msg["To"] = EMAIL_TO
-
-        ctx = ssl.create_default_context()
-
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=ctx) as server:
+        with smtplib.SMTP_SSL(
+            "smtp.gmail.com", 465, context=ssl.create_default_context()
+        ) as server:
             server.login(EMAIL_FROM, EMAIL_APP_PASSWORD)
             server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-
         print("Mail enviado OK.")
         return True
-
     except Exception as exc:
         print(f"ERROR enviando mail: {exc}")
         return False
 
+def esperar_select(page, selector, timeout_s=12):
+    limite = time.time() + timeout_s
+    while time.time() < limite:
+        resultado = []
+        for opcion in page.query_selector_all(f"{selector} option"):
+            texto = opcion.inner_text().strip()
+            value = opcion.get_attribute("value")
+            if texto and value:
+                resultado.append((texto, value))
+        if resultado:
+            return resultado
+        page.wait_for_timeout(500)
+    return []
 
-def buscar_fechas_disponibles(page) -> dict[str, str]:
-    page.goto(URL_BOLETERIA, wait_until="networkidle", timeout=60000)
-
-    page.select_option(SEL_CINE, label=CINE_TEXTO)
+def leer_una_vez(page):
+    page.goto(URL_BOLETERIA, wait_until="domcontentloaded", timeout=60000)
     page.wait_for_timeout(1500)
 
-    opciones_pelicula = page.query_selector_all(f"{SEL_PELICULA} option")
-    textos_pelicula = [o.inner_text().strip() for o in opciones_pelicula]
+    page.select_option(SEL_CINE, label=CINE_TEXTO)
+    page.wait_for_timeout(1200)
+
+    peliculas = esperar_select(page, SEL_PELICULA)
+    if not peliculas:
+        raise ErrorTransitorioShowcase(
+            "El selector de películas quedó vacío después de elegir IMAX Norcenter."
+        )
 
     patron = re.compile(re.escape(PELICULA_TEXTO), re.I)
-    coincidencia = next((t for t in textos_pelicula if patron.search(t)), None)
-
+    coincidencia = next(
+        (texto for texto, _ in peliculas if patron.search(texto)), None
+    )
     if coincidencia is None:
         raise RuntimeError(
-            f"No se encontró '{PELICULA_TEXTO}'. Opciones: {textos_pelicula}"
+            f"No se encontró '{PELICULA_TEXTO}'. "
+            f"Opciones visibles: {[t for t, _ in peliculas]}"
         )
 
     page.select_option(SEL_PELICULA, label=coincidencia)
-    page.wait_for_timeout(1500)
+    page.wait_for_timeout(1200)
 
-    opciones_formato = page.query_selector_all(f"{SEL_FORMATO} option")
-    formatos = []
-
-    for opcion in opciones_formato:
-        texto = opcion.inner_text().strip()
-        valor = opcion.get_attribute("value")
-
-        if texto and valor:
-            formatos.append((texto, valor))
-
+    formatos = esperar_select(page, SEL_FORMATO)
     if not formatos:
-        raise RuntimeError("No se encontraron formatos disponibles.")
+        raise ErrorTransitorioShowcase("El selector de formatos quedó vacío.")
 
-    formato_imax = next(
+    formato = next(
         (item for item in formatos if "IMAX" in item[0].upper()),
         formatos[0],
     )
+    page.select_option(SEL_FORMATO, value=formato[1])
+    page.wait_for_timeout(1200)
 
-    page.select_option(SEL_FORMATO, value=formato_imax[1])
-    page.wait_for_timeout(1500)
+    limite = time.time() + 12
+    textos_dia = []
+    while time.time() < limite:
+        textos_dia = [
+            o.inner_text().strip()
+            for o in page.query_selector_all(f"{SEL_DIA} option")
+            if o.inner_text().strip()
+        ]
+        if textos_dia:
+            break
+        page.wait_for_timeout(500)
 
-    opciones_dia = page.query_selector_all(f"{SEL_DIA} option")
+    if not textos_dia:
+        raise ErrorTransitorioShowcase("El selector de días quedó vacío.")
+
     fechas = {}
-
-    for opcion in opciones_dia:
-        texto = opcion.inner_text().strip()
-
-        if not texto:
-            continue
-
-        fecha = parsear_fecha(texto)
-
-        if fecha:
-            fechas[fecha.isoformat()] = texto
+    for texto in textos_dia:
+        f = parsear_fecha(texto)
+        if f:
+            fechas[f.isoformat()] = texto
 
     if not fechas:
-        textos = [o.inner_text().strip() for o in opciones_dia]
-        raise RuntimeError(
-            f"No se pudieron leer fechas válidas. Opciones visibles: {textos}"
+        raise ErrorTransitorioShowcase(
+            f"No se pudieron interpretar las fechas: {textos_dia}"
         )
 
     return dict(sorted(fechas.items()))
 
+def buscar_fechas():
+    ultimo_error = None
+    for intento in range(1, MAX_INTENTOS + 1):
+        print(f"Intento {intento}/{MAX_INTENTOS}...")
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page(locale="es-AR")
+                fechas = leer_una_vez(page)
+                browser.close()
+            return fechas
+        except ErrorTransitorioShowcase as exc:
+            ultimo_error = exc
+            print(f"Fallo transitorio: {exc}")
+            if intento < MAX_INTENTOS:
+                time.sleep(ESPERA_ENTRE_INTENTOS)
+        except Exception:
+            raise
+
+    raise ErrorTransitorioShowcase(
+        f"Showcase no respondió bien tras {MAX_INTENTOS} intentos. "
+        f"Último error: {ultimo_error}"
+    )
 
 def main():
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(locale="es-AR")
-
-            fechas_actuales = buscar_fechas_disponibles(page)
-
-            browser.close()
+        fechas_actuales = buscar_fechas()
 
         print("Fechas actualmente publicadas:")
-
         for iso, etiqueta in fechas_actuales.items():
             print(f"  {iso} | {etiqueta}")
 
         estado = cargar_estado()
-        actuales = set(fechas_actuales.keys())
+        actuales = set(fechas_actuales)
 
-        # Primera ejecución: crear línea base sin alertar.
         if estado is None:
-            guardar_estado(
-                {
-                    "seen_dates": sorted(actuales),
-                    "current_dates": sorted(actuales),
-                    "labels": fechas_actuales,
-                }
-            )
-
-            print("Primera ejecución: línea base creada. No se envía alerta.")
+            guardar_estado({
+                "seen_dates": sorted(actuales),
+                "current_dates": sorted(actuales),
+                "labels": fechas_actuales,
+            })
+            print("Primera ejecución: línea base creada.")
             return
 
         vistas = set(estado.get("seen_dates", []))
         nuevas = sorted(actuales - vistas)
 
         if nuevas:
-            lineas = "\n".join(
-                f"• {fechas_actuales[fecha]}" for fecha in nuevas
-            )
-
+            lineas = "\n".join(f"• {fechas_actuales[f]}" for f in nuevas)
             cuerpo = (
                 "🚨 LA ODISEA — NUEVAS FECHAS IMAX NORCENTER\n\n"
                 f"{lineas}\n\n"
                 "Entrá ahora a comprar:\n"
                 f"{URL_BOLETERIA}"
             )
-
-            print(f"Nuevas fechas detectadas: {nuevas}")
-
             if not enviar_mail(
                 "🚨 Nuevas fechas de La Odisea en IMAX Norcenter",
-                cuerpo,
+                cuerpo
             ):
-                # No marcar como vistas si el mail falló.
-                estado["current_dates"] = sorted(actuales)
-                estado["labels"] = fechas_actuales
-                guardar_estado(estado)
                 sys.exit(2)
-
             vistas.update(nuevas)
-
         else:
             print("Sin fechas nuevas.")
 
         estado["seen_dates"] = sorted(vistas)
         estado["current_dates"] = sorted(actuales)
         estado["labels"] = fechas_actuales
-
         guardar_estado(estado)
-
         print("Revisión completada OK.")
 
-    except Exception as exc:
-        print(f"ERROR: {exc}")
+    except ErrorTransitorioShowcase as exc:
+        print(f"AVISO TRANSITORIO: {exc}")
+        print("No se modifica el estado. Se reintentará en el próximo run.")
+        sys.exit(0)
 
+    except Exception as exc:
+        print(f"ERROR REAL: {exc}")
         if EMAIL_FROM and EMAIL_APP_PASSWORD and EMAIL_TO:
             enviar_mail(
                 "⚠️ Falló el monitor de La Odisea",
                 (
-                    "El monitor de La Odisea en IMAX Norcenter falló.\n\n"
+                    "El monitor tuvo un error que no parece ser una "
+                    "carga transitoria de Showcase.\n\n"
                     f"Error: {repr(exc)}\n\n"
                     "Revisá GitHub Actions."
                 ),
             )
-
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
