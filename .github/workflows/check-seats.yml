@@ -2,13 +2,21 @@ name: Chequear nuevas funciones de La Odisea
 
 on:
   schedule:
-    # Cada 10 minutos. No requiere login ni reservas, es liviano.
-    - cron: "7,17,27,37,47,57 * * * *"
-  workflow_dispatch: {}   # permite tirarlo a mano desde la pestaña Actions
+    - cron: "23 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: imax-norcenter-monitor
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 58
+
     steps:
       - name: Clonar repo
         uses: actions/checkout@v4
@@ -23,18 +31,37 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      - name: Correr el monitor
+      - name: Configurar Git
+        run: |
+          git config user.name "showcase-bot"
+          git config user.email "actions@github.com"
+
+      - name: Chequear cada 10 minutos
         env:
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
           EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-        run: python monitor.py
-
-      - name: Guardar estado (evita re-notificar)
-        if: always()
         run: |
-          git config user.name "showcase-bot"
-          git config user.email "actions@github.com"
-          git add notified_state.json || true
-          git diff --staged --quiet || git commit -m "actualizar estado de notificaciones [skip ci]"
-          git push || true
+          for i in 1 2 3 4 5 6; do
+            echo "========================================"
+            echo "Chequeo $i/6 - $(date -u)"
+            echo "========================================"
+
+            git pull --rebase origin main || true
+            python monitor.py || true
+
+            git add notified_state.json || true
+
+            if ! git diff --cached --quiet; then
+              git commit -m "actualizar estado IMAX [skip ci]"
+              git push origin main || {
+                git pull --rebase origin main
+                git push origin main
+              }
+            fi
+
+            if [ "$i" -lt 6 ]; then
+              echo "Esperando 10 minutos..."
+              sleep 600
+            fi
+          done
